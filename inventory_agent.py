@@ -632,16 +632,20 @@ class InventoryForm(tk.Tk):
         # ── Buttons ───────────────────────────────────────────────────────────
         bf = tk.Frame(self, bg=BG_COLOR)
         bf.pack(fill="x", padx=26, pady=(10, 20))
-        tk.Button(
-            bf, text="Cancel", command=self._on_cancel,
-            font=("Helvetica", 11), fg="#6B7280", bg="#E5E7EB",
-            relief="flat", padx=18, pady=7, cursor="hand2", activebackground="#D1D5DB",
-        ).pack(side="right", padx=(8, 0))
-        tk.Button(
-            bf, text="Submit →", command=self._on_submit,
-            font=("Helvetica", 11, "bold"), fg="white", bg=ACCENT_COLOR,
-            relief="flat", padx=18, pady=7, cursor="hand2", activebackground="#C0252E",
-        ).pack(side="right")
+        self._flat_button(bf, "Cancel", self._on_cancel,
+                          bg="#E5E7EB", hover="#D1D5DB", fg="#374151").pack(side="right", padx=(8, 0))
+        self._flat_button(bf, "Submit →", self._on_submit,
+                          bg=ACCENT_COLOR, hover="#C0252E", fg="white", bold=True).pack(side="right")
+
+    @staticmethod
+    def _flat_button(parent, text: str, command, bg: str, hover: str, fg: str, bold: bool = False):
+        """Label-based button: macOS ignores tk.Button's background colour, a Label keeps it."""
+        b = tk.Label(parent, text=text, bg=bg, fg=fg, cursor="hand2", padx=18, pady=7,
+                     font=("Helvetica", 11, "bold" if bold else "normal"))
+        b.bind("<Button-1>", lambda _e: command())
+        b.bind("<Enter>", lambda _e: b.configure(bg=hover))
+        b.bind("<Leave>", lambda _e: b.configure(bg=bg))
+        return b
 
     def _field(self, parent: tk.Frame, label: str, row: int) -> tk.Entry:
         tk.Label(parent, text=label, font=("Helvetica", 11, "bold"),
