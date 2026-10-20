@@ -12,3 +12,7 @@ build_pkg/
 state.json
 queue.json
 .DS_Store
+
+# Python bytecode
+__pycache__/
+*.pyc

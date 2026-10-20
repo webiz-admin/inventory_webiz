@@ -24,6 +24,7 @@
 // ── Sheet names ───────────────────────────────────────────────────────────────
 const SHEET_NAME     = "Inventory";
 const CHANGELOG_NAME = "Change Log";
+const MONITORS_NAME  = "Monitors";
 
 // ── Email policy ──────────────────────────────────────────────────────────────
 // The user's confirmation copy is only sent to these domains; everything else
@@ -39,7 +40,7 @@ const MAX_FIELD_LEN = 200;
 const HEADERS = [
   "Timestamp", "First Name", "Last Name", "Email", "Project",
   "Hostname", "IP Address", "Brand", "Model", "Serial Number",
-  "CPU", "RAM", "Storage", "OS"
+  "CPU", "RAM", "Storage", "OS", "External Monitors"
 ];
 
 // 0-based column indices for Inventory
@@ -58,6 +59,29 @@ const COL = {
   RAM:           11,
   STORAGE:       12,
   OS:            13,
+  MONITORS:      14,   // summary only — not part of the "did the device change" comparison
+};
+
+// ── Monitors sheet: one row per physical monitor ──────────────────────────────
+const MONITOR_HEADERS = [
+  "Last Seen", "Device Serial", "Hostname", "Owner", "Email", "Project",
+  "Brand", "Model", "Monitor Serial", "Size (in)", "Resolution", "Connection",
+  "Year", "First Seen"
+];
+const MCOL = {
+  LAST_SEEN: 0, DEVICE_SERIAL: 1, HOSTNAME: 2, OWNER: 3, EMAIL: 4, PROJECT: 5,
+  BRAND: 6, MODEL: 7, SERIAL: 8, SIZE: 9, RESOLUTION: 10, CONNECTION: 11,
+  YEAR: 12, FIRST_SEEN: 13,
+};
+const MAX_MONITORS = 8;
+
+// EDID manufacturer (PNP) id → brand. Unknown ids are shown as the raw code.
+const PNP_BRANDS = {
+  DEL: "Dell", GSM: "LG", LGD: "LG", SAM: "Samsung", SEC: "Samsung", HWP: "HP", HPN: "HP",
+  LEN: "Lenovo", ACI: "ASUS", AUS: "ASUS", ACR: "Acer", PHL: "Philips", BNQ: "BenQ",
+  AOC: "AOC", VSC: "ViewSonic", APP: "Apple", MSI: "MSI", GBT: "Gigabyte", IVM: "iiyama",
+  EIZ: "EIZO", NEC: "NEC", SNY: "Sony", XMI: "Xiaomi", HKC: "HKC", KTC: "KTC",
+  HUW: "Huawei", MEI: "Panasonic", FUS: "Fujitsu", SHP: "Sharp", TOS: "Toshiba",
 };
 
 // ── Change Log columns ────────────────────────────────────────────────────────
@@ -94,14 +118,19 @@ function getOrCreateSheet(ss, name, headers, headerBg) {
   if (!sheet) {
     sheet = ss.insertSheet(name);
   }
-  if (sheet.getLastRow() === 0) {
-    sheet.appendRow(headers);
-    const hdr = sheet.getRange(1, 1, 1, headers.length);
-    hdr.setFontWeight("bold")
+  const styleHeader = range => range.setFontWeight("bold")
        .setBackground(headerBg || "#1A2B5A")
        .setFontColor("#FFFFFF")
        .setHorizontalAlignment("center");
+  if (sheet.getLastRow() === 0) {
+    sheet.appendRow(headers);
+    styleHeader(sheet.getRange(1, 1, 1, headers.length));
     sheet.setFrozenRows(1);
+  } else if (sheet.getLastColumn() < headers.length) {
+    // Columns added in a later version: extend the existing header row
+    const from = sheet.getLastColumn() + 1;
+    const missing = headers.slice(from - 1);
+    styleHeader(sheet.getRange(1, from, 1, missing.length).setValues([missing]));
   }
   return sheet;
 }
@@ -209,7 +238,8 @@ function deviceSummary(f) {
          `OS        : ${f.os}\n` +
          `Hostname  : ${f.hostname}\n` +
          `IP        : ${f.ip_address}\n` +
-         `Timestamp : ${f.timestamp}\n`;
+         `Timestamp : ${f.timestamp}\n` +
+         `Monitors  : ${monitorsSummary(f.monitors || [])}\n`;
 }
 
 function notifyCheckin(f, queued) {
@@ -242,6 +272,95 @@ function notifyCancelled(f) {
     `[Webiz Inventory] CANCELLED – SN: ${f.serial_number || "N/A"} / ${f.hostname}`, body);
 }
 
+// ── Monitors ──────────────────────────────────────────────────────────────────
+
+/** Validates and normalises the agent's monitor list. */
+function cleanMonitors(raw) {
+  if (!Array.isArray(raw)) return [];
+  return raw.slice(0, MAX_MONITORS)
+    .filter(m => m && typeof m === "object")
+    .map(m => {
+      const pnp = clean(m.manufacturer_id, 3).toUpperCase();
+      let serial = clean(m.serial, 64);
+      if (/^0+$/.test(serial)) serial = "";   // many monitors report 0 instead of a serial
+      return {
+        brand:      PNP_BRANDS[pnp] || pnp,
+        model:      clean(m.name, 100) || clean(m.product_code, 20),
+        serial:     serial,
+        size:       clean(m.size_in, 5),
+        resolution: clean(m.resolution, 20),
+        connection: clean(m.connection, 40),
+        year:       clean(m.year, 4),
+      };
+    })
+    .filter(m => m.brand || m.model);
+}
+
+function monitorLabel(m) {
+  // "Dell" + "DELL U2724DE" → "Dell U2724DE"
+  const sameBrand = m.brand && m.model.toLowerCase().indexOf(m.brand.toLowerCase()) === 0;
+  return [m.brand, sameBrand ? m.model.slice(m.brand.length).trim() : m.model]
+           .filter(Boolean).join(" ") +
+         (m.size ? ` ${m.size}"` : "") + (m.connection ? ` (${m.connection})` : "");
+}
+
+function monitorsSummary(monitors) {
+  return monitors.length ? monitors.map(monitorLabel).join("; ") : "None";
+}
+
+/**
+ * One row per physical monitor. Identified by Brand + Model + Serial; monitors without a
+ * serial can only be told apart per device, so they are keyed by Device Serial + Brand + Model.
+ * A monitor seen on a different device is updated in place and the move goes to the Change Log.
+ */
+function upsertMonitors(ss, f, monitors, now) {
+  if (!monitors.length) return;
+  const sheet = getOrCreateSheet(ss, MONITORS_NAME, MONITOR_HEADERS, "#3B5B92");
+  const last  = sheet.getLastRow();
+  const rows  = last > 1 ? sheet.getRange(2, 1, last - 1, MONITOR_HEADERS.length).getValues() : [];
+  const str   = v => String(v).trim();
+  const owner = `${f.first_name} ${f.last_name}`.trim();
+  const deviceKey = f.serial_number || f.hostname;
+
+  monitors.forEach(m => {
+    const idx = rows.findIndex(r => m.serial
+      ? str(r[MCOL.BRAND]) === m.brand && str(r[MCOL.MODEL]) === m.model && str(r[MCOL.SERIAL]) === m.serial
+      : !str(r[MCOL.SERIAL]) && str(r[MCOL.DEVICE_SERIAL]) === deviceKey &&
+        str(r[MCOL.BRAND]) === m.brand && str(r[MCOL.MODEL]) === m.model);
+
+    const values = [];
+    values[MCOL.LAST_SEEN]     = now;
+    values[MCOL.DEVICE_SERIAL] = deviceKey;
+    values[MCOL.HOSTNAME]      = f.hostname;
+    values[MCOL.OWNER]         = owner;
+    values[MCOL.EMAIL]         = f.email;
+    values[MCOL.PROJECT]       = f.project;
+    values[MCOL.BRAND]         = m.brand;
+    values[MCOL.MODEL]         = m.model;
+    values[MCOL.SERIAL]        = m.serial;
+    values[MCOL.SIZE]          = m.size;
+    values[MCOL.RESOLUTION]    = m.resolution;
+    values[MCOL.CONNECTION]    = m.connection;
+    values[MCOL.YEAR]          = m.year;
+    values[MCOL.FIRST_SEEN]    = idx === -1 ? now : rows[idx][MCOL.FIRST_SEEN];
+
+    if (idx === -1) {
+      sheet.appendRow(values.map(sheetSafe));
+      rows.push(values);
+    } else {
+      const prev = rows[idx];
+      if (str(prev[MCOL.DEVICE_SERIAL]) !== deviceKey) {
+        appendChangeLog(ss, sheetSafe(m.serial || m.model), sheetSafe(f.hostname),
+          sheetSafe(`Monitor ${monitorLabel(m)} moved from ${str(prev[MCOL.HOSTNAME])} ` +
+                    `(${str(prev[MCOL.OWNER])}) to ${f.hostname} (${owner}) – ${now}`));
+      }
+      sheet.getRange(idx + 2, 1, 1, MONITOR_HEADERS.length).setValues([values.map(sheetSafe)]);
+      rows[idx] = values;
+    }
+  });
+  sheet.autoResizeColumns(1, MONITOR_HEADERS.length);
+}
+
 // ── Web App entry point ───────────────────────────────────────────────────────
 
 function doPost(e) {
@@ -260,6 +379,7 @@ function doPost(e) {
      "hostname", "ip_address", "brand", "model", "serial_number",
      "cpu", "ram", "storage", "os"].forEach(k => { f[k] = clean(data[k]); });
     f.email = f.email.toLowerCase();
+    f.monitors = cleanMonitors(data.monitors);
 
     const type = clean(data.type || "checkin", 20);
 
@@ -299,6 +419,7 @@ function doPost(e) {
       f.ram,
       f.storage,
       f.os,
+      monitorsSummary(f.monitors),
     ];
 
     const existing = findExistingRow(invSheet, sn, hostname);
@@ -309,14 +430,19 @@ function doPost(e) {
       invSheet.autoResizeColumns(1, HEADERS.length);
 
     } else {
-      // ── Known device: compare all fields except Timestamp ────────────────
-      const allMatch = HEADERS.slice(1).every((_, i) => {
-        const col = i + 1; // skip Timestamp (index 0)
-        return String(newRowValues[col]).trim() === String(existing.values[col]).trim();
-      });
+      // ── Known device: compare device/owner fields (skip Timestamp and the
+      //    monitor summary — monitor changes are tracked on the Monitors sheet)
+      let allMatch = true;
+      for (let col = 1; col <= COL.OS; col++) {
+        if (String(newRowValues[col]).trim() !== String(existing.values[col]).trim()) allMatch = false;
+      }
 
       if (allMatch) {
-        // Nothing changed — skip Inventory update, log to Change Log only
+        // Nothing changed — keep the row, only refresh the monitor summary if it differs
+        if (String(existing.values[COL.MONITORS]).trim() !== newRowValues[COL.MONITORS]) {
+          invSheet.getRange(existing.rowNum, COL.MONITORS + 1)
+                  .setValue(sheetSafe(newRowValues[COL.MONITORS]));
+        }
         appendChangeLog(ss, sheetSafe(sn), sheetSafe(hostname),
           `Collected nothing changed – ${now}`);
 
@@ -334,6 +460,8 @@ function doPost(e) {
           sheetSafe(`Previous Checkin device owner was: ${prevFirst} ${prevLast} – ${now}`));
       }
     }
+
+    upsertMonitors(ss, f, f.monitors, now);
 
     lock.releaseLock();
     notifyCheckin(f, data.submission_type === "queued");

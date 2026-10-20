@@ -164,6 +164,183 @@ def get_ip() -> str:
         except Exception:
             return "N/A"
 
+# ─── External monitors ────────────────────────────────────────────────────────
+# Each monitor: manufacturer_id (3-letter PNP code, mapped to a brand by the
+# Apps Script), name, product_code, serial, size_in, resolution, connection, year.
+# USB-C / Thunderbolt monitors use DisplayPort Alt Mode, so they are reported
+# as "DisplayPort/USB-C" — the OS cannot tell them apart from a DP cable.
+MAX_MONITORS = 8
+
+def _pnp(vendor: int) -> str:
+    """16-bit EDID/EISA vendor number → 3-letter PNP id (e.g. 0x10AC → DEL)."""
+    return "".join(chr(((vendor >> sh) & 31) + 64) for sh in (10, 5, 0)) if vendor else ""
+
+def _diag_in(w_mm: float, h_mm: float):
+    return round((w_mm ** 2 + h_mm ** 2) ** 0.5 / 25.4) if w_mm and h_mm else ""
+
+def _connection(raw: str) -> str:
+    r = (raw or "").lower()
+    if "hdmi" in r:
+        return "HDMI"
+    if r in ("dp", "displayport") or "displayport" in r:
+        return "DisplayPort/USB-C"
+    if "dvi" in r:
+        return "DVI"
+    if "vga" in r:
+        return "VGA"
+    if "airplay" in r:
+        return "AirPlay"
+    return raw or ""
+
+def _mac_cg_displays() -> list:
+    """External displays via CoreGraphics (works on Intel + Apple Silicon)."""
+    import ctypes, ctypes.util
+    cg = ctypes.CDLL(ctypes.util.find_library("CoreGraphics"))
+
+    class CGSize(ctypes.Structure):
+        _fields_ = [("width", ctypes.c_double), ("height", ctypes.c_double)]
+
+    u32 = ctypes.c_uint32
+    cg.CGGetOnlineDisplayList.argtypes = [u32, ctypes.POINTER(u32), ctypes.POINTER(u32)]
+    for fn in ("CGDisplayIsBuiltin", "CGDisplayVendorNumber",
+               "CGDisplayModelNumber", "CGDisplaySerialNumber"):
+        getattr(cg, fn).argtypes = [u32]
+        getattr(cg, fn).restype = u32
+    cg.CGDisplayScreenSize.argtypes = [u32]
+    cg.CGDisplayScreenSize.restype = CGSize
+
+    ids, n = (u32 * 32)(), u32()
+    if cg.CGGetOnlineDisplayList(32, ids, ctypes.byref(n)) != 0:
+        return []
+    out = []
+    for d in ids[:n.value]:
+        if cg.CGDisplayIsBuiltin(d):
+            continue
+        size = cg.CGDisplayScreenSize(d)
+        out.append({
+            "id": int(d),
+            "vendor": cg.CGDisplayVendorNumber(d),
+            "model": cg.CGDisplayModelNumber(d),
+            "serial_num": cg.CGDisplaySerialNumber(d),
+            "size_in": _diag_in(size.width, size.height),
+        })
+    return out
+
+def _collect_monitors_mac() -> list:
+    # system_profiler: name, native resolution, year — keyed by CoreGraphics display id
+    sp = {}
+    try:
+        data = json.loads(_run(["system_profiler", "SPDisplaysDataType", "-json"]) or "{}")
+        for gpu in data.get("SPDisplaysDataType", []):
+            for m in gpu.get("spdisplays_ndrvs", []):
+                if m.get("_spdisplays_displayID"):
+                    sp[str(m["_spdisplays_displayID"])] = m
+    except Exception:
+        pass
+
+    # IORegistry (Apple Silicon): product name, alphanumeric serial, link type
+    io = []
+    try:
+        import plistlib
+        raw = subprocess.run(["ioreg", "-arw0", "-k", "DisplayAttributes"],
+                             capture_output=True, timeout=15).stdout
+        for e in plistlib.loads(raw) if raw else []:
+            pa = e.get("DisplayAttributes", {}).get("ProductAttributes", {})
+            io.append((pa, (e.get("Transport") or {}).get("Downstream", "")))
+    except Exception:
+        pass
+
+    monitors = []
+    for d in _mac_cg_displays():
+        m = sp.get(str(d["id"]), {})
+        pa, link = {}, ""
+        candidates = [(a, t) for a, t in io
+                      if a.get("LegacyManufacturerID") == d["vendor"] and a.get("ProductID") == d["model"]]
+        for a, t in candidates:   # identical models: pick the one with the same numeric serial
+            if len(candidates) == 1 or a.get("SerialNumber") == d["serial_num"]:
+                pa, link = a, t
+                break
+        pixels = (m.get("_spdisplays_pixels") or "").replace(" ", "")
+        monitors.append({
+            "manufacturer_id": pa.get("ManufacturerID") or _pnp(d["vendor"]),
+            "name":            pa.get("ProductName") or m.get("_name", ""),
+            "product_code":    f"{d['model']:04X}" if d["model"] else "",
+            "serial":          str(pa.get("AlphanumericSerialNumber") or (d["serial_num"] or "")),
+            "size_in":         d["size_in"],
+            "resolution":      pixels,
+            "connection":      _connection(link),
+            "year":            pa.get("YearOfManufacture") or m.get("_spdisplays_display-year", ""),
+        })
+    return monitors
+
+def _parse_edid(edid: bytes) -> dict:
+    """Minimal EDID 1.x parser (base block only)."""
+    if len(edid) < 128 or edid[:8] != b"\x00\xff\xff\xff\xff\xff\xff\x00":
+        return {}
+    info = {
+        "manufacturer_id": _pnp((edid[8] << 8) | edid[9]),
+        "product_code":    f"{edid[10] | (edid[11] << 8):04X}",
+        "serial":          "",
+        "name":            "",
+        "size_in":         _diag_in(edid[21] * 10, edid[22] * 10),
+        "resolution":      "",
+        "year":            1990 + edid[17] if edid[17] else "",
+    }
+    serial_num = int.from_bytes(edid[12:16], "little")
+    for off in (54, 72, 90, 108):
+        blk = edid[off:off + 18]
+        if blk[0] == 0 and blk[1] == 0:          # display descriptor
+            text = blk[5:18].split(b"\x0a")[0].decode("ascii", "ignore").strip()
+            if blk[3] == 0xFC:
+                info["name"] = text
+            elif blk[3] == 0xFF:
+                info["serial"] = text
+        elif off == 54:                           # first detailed timing = preferred mode
+            h = blk[2] | ((blk[4] & 0xF0) << 4)
+            v = blk[5] | ((blk[7] & 0xF0) << 4)
+            if h and v:
+                info["resolution"] = f"{h}x{v}"
+    if not info["serial"] and serial_num:
+        info["serial"] = str(serial_num)
+    return info
+
+def _collect_monitors_linux() -> list:
+    monitors = []
+    for conn in sorted(Path("/sys/class/drm").glob("card*-*")):
+        port = conn.name.split("-", 1)[1]                 # e.g. HDMI-A-1, DP-2, eDP-1
+        if port.startswith(("eDP", "LVDS", "DSI")):       # built-in panel
+            continue
+        try:
+            if (conn / "status").read_text().strip() != "connected":
+                continue
+            info = _parse_edid((conn / "edid").read_bytes())
+        except Exception:
+            continue
+        if info:
+            info["connection"] = _connection("HDMI" if port.startswith("HDMI") else
+                                             "DisplayPort" if port.startswith("DP") else port)
+            monitors.append(info)
+    return monitors
+
+def collect_monitors() -> list:
+    """Never raises — a monitor problem must not block the check-in."""
+    try:
+        mons = _collect_monitors_mac() if _sys == "Darwin" else _collect_monitors_linux()
+    except Exception as e:
+        log.warning(f"Monitor detection failed: {e}")
+        return []
+    return [{k: (_clean(str(v)) if v not in ("", None) else "") for k, v in m.items()}
+            for m in mons[:MAX_MONITORS]]
+
+def monitors_summary(monitors: list) -> str:
+    if not monitors:
+        return "none detected"
+    return "; ".join(
+        " ".join(x for x in (m.get("name") or m.get("manufacturer_id", ""),
+                             f'{m["size_in"]}"' if m.get("size_in") else "",
+                             f'({m["connection"]})' if m.get("connection") else "") if x)
+        for m in monitors)
+
 def collect_hardware() -> dict:
     hw = {
         "hostname":   socket.gethostname(),
@@ -222,6 +399,7 @@ def collect_hardware() -> dict:
         hw["storage"] = _clean(blk.splitlines()[0]) if blk else "N/A"
         hw["os"]      = f"Linux {platform.release()}"
 
+    hw["monitors"]  = collect_monitors()
     hw["timestamp"] = datetime.datetime.now().isoformat(timespec="seconds")
     return hw
 
@@ -400,7 +578,8 @@ class InventoryForm(tk.Tk):
         preview = (
             f"  {hw['brand']} {hw['model']}  •  SN: {hw.get('serial_number','?')}  •  {hw['os']}\n"
             f"  CPU: {hw['cpu']}  •  RAM: {hw['ram']}  •  Storage: {hw['storage']}\n"
-            f"  Host: {hw['hostname']}  •  IP: {hw['ip_address']}"
+            f"  Host: {hw['hostname']}  •  IP: {hw['ip_address']}\n"
+            f"  Monitors: {monitors_summary(hw.get('monitors', []))}"
         )
         tk.Label(pf, text=preview, font=("Helvetica", 9), fg="#374151",
                  bg=BG_COLOR, justify="left", wraplength=468).pack(anchor="w")

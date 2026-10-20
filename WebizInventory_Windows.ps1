@@ -205,7 +205,82 @@ function Get-Hardware {
         $hw.ip_address = "N/A"
         $hw.timestamp  = (Get-Date -Format "yyyy-MM-ddTHH:mm:ss")
     }
+    $hw.monitors = @(Get-Monitors)
     return $hw
+}
+
+# ════════════════════════════════════════════════════════════════════════════════
+#  EXTERNAL MONITORS (EDID via WMI — no admin needed)
+#  USB-C / Thunderbolt monitors use DisplayPort Alt Mode, so they are reported as
+#  "DisplayPort/USB-C". Brand names are mapped from the PNP id by the Apps Script.
+# ════════════════════════════════════════════════════════════════════════════════
+function Get-Monitors {
+    $monitors = @()
+    try {
+        $ids = @(Get-CimInstance -Namespace root\wmi -ClassName WmiMonitorID -ErrorAction Stop)
+        $conns = @{}; $sizes = @{}; $modes = @{}
+        Get-CimInstance -Namespace root\wmi -ClassName WmiMonitorConnectionParams -ErrorAction SilentlyContinue |
+            ForEach-Object { $conns[$_.InstanceName] = [uint32]$_.VideoOutputTechnology }
+        Get-CimInstance -Namespace root\wmi -ClassName WmiMonitorBasicDisplayParams -ErrorAction SilentlyContinue |
+            ForEach-Object { $sizes[$_.InstanceName] = $_ }
+        Get-CimInstance -Namespace root\wmi -ClassName WmiMonitorListedSupportedSourceModes -ErrorAction SilentlyContinue |
+            ForEach-Object { $modes[$_.InstanceName] = $_ }
+        $decode = { param($a) if ($a) { (-join ($a | Where-Object { $_ -gt 0 } | ForEach-Object { [char]$_ })).Trim() } else { "" } }
+
+        foreach ($m in $ids) {
+            $tech = $conns[$m.InstanceName]
+            # Built-in panel: LVDS (6), embedded DisplayPort (11), embedded UDI (13), INTERNAL (0x80000000)
+            if ($tech -in @(6, 11, 13) -or $tech -eq 2147483648) { continue }
+            $connection = switch ($tech) {
+                0  { "VGA" }
+                4  { "DVI" }
+                5  { "HDMI" }
+                10 { "DisplayPort/USB-C" }
+                12 { "UDI" }
+                15 { "Miracast" }
+                16 { "Indirect (dock/USB)" }
+                default { "" }
+            }
+            $sizeIn = ""
+            $bp = $sizes[$m.InstanceName]
+            if ($bp -and $bp.MaxHorizontalImageSize -and $bp.MaxVerticalImageSize) {
+                $sizeIn = [math]::Round([math]::Sqrt([math]::Pow($bp.MaxHorizontalImageSize, 2) +
+                                                     [math]::Pow($bp.MaxVerticalImageSize, 2)) / 2.54)
+            }
+            $resolution = ""
+            $sm = $modes[$m.InstanceName]
+            if ($sm -and $sm.MonitorSourceModes) {
+                $pm = $sm.MonitorSourceModes[[int]$sm.PreferredMonitorSourceModeIndex]
+                if ($pm) { $resolution = "$($pm.HorizontalActivePixels)x$($pm.VerticalActivePixels)" }
+            }
+            $serial = & $decode $m.SerialNumberID
+            if ($serial -eq "0") { $serial = "" }
+            $monitors += [pscustomobject]@{
+                manufacturer_id = & $decode $m.ManufacturerName
+                name            = & $decode $m.UserFriendlyName
+                product_code    = & $decode $m.ProductCodeID
+                serial          = $serial
+                size_in         = "$sizeIn"
+                resolution      = $resolution
+                connection      = $connection
+                year            = if ($m.YearOfManufacture) { "$($m.YearOfManufacture)" } else { "" }
+            }
+            if ($monitors.Count -ge 8) { break }
+        }
+    } catch {
+        Write-Log "Monitor detection failed: $_" "WARN"   # never blocks the check-in
+    }
+    return $monitors
+}
+
+function Format-Monitors($monitors) {
+    if (-not $monitors -or @($monitors).Count -eq 0) { return "none detected" }
+    return (@($monitors) | ForEach-Object {
+        $label = if ($_.name) { $_.name } else { $_.manufacturer_id }
+        if ($_.size_in)    { $label += " $($_.size_in)`"" }
+        if ($_.connection) { $label += " ($($_.connection))" }
+        $label
+    }) -join "; "
 }
 
 # ════════════════════════════════════════════════════════════════════════════════
@@ -221,7 +296,7 @@ function Submit-ToSheets {
         # Token is added only here so it is never written to the offline queue
         $req = @{} + $Payload
         $req["token"] = $AgentToken
-        $body = $req | ConvertTo-Json -Compress
+        $body = $req | ConvertTo-Json -Compress -Depth 5   # monitors are nested objects
         $resp = Invoke-RestMethod -Uri $AppsScriptUrl -Method POST -Body $body `
                     -ContentType "application/json" -TimeoutSec 15
         return ($resp.status -eq "ok")
@@ -295,7 +370,7 @@ function Show-InventoryForm {
     # ── Form ──────────────────────────────────────────────────────────────────
     $form                  = New-Object System.Windows.Forms.Form
     $form.Text             = "Webiz Inventory Agent"
-    $form.ClientSize       = New-Object System.Drawing.Size(520, 684)
+    $form.ClientSize       = New-Object System.Drawing.Size(520, 702)
     $form.StartPosition    = "CenterScreen"
     $form.FormBorderStyle  = "FixedDialog"
     $form.MaximizeBox      = $false
@@ -427,7 +502,7 @@ function Show-InventoryForm {
 
     $hwPanel           = New-Object System.Windows.Forms.Panel
     $hwPanel.Location  = New-Object System.Drawing.Point(26, $yPos)
-    $hwPanel.Size      = New-Object System.Drawing.Size(468, 142)
+    $hwPanel.Size      = New-Object System.Drawing.Size(468, 160)
     $hwPanel.BackColor = [System.Drawing.Color]::FromArgb(229, 234, 242)
     $form.Controls.Add($hwPanel)
 
@@ -439,6 +514,7 @@ function Show-InventoryForm {
         "RAM"      = $HW.ram
         "Storage"  = $HW.storage
         "Hostname" = "$($HW.hostname)  /  $($HW.ip_address)"
+        "Monitors" = Format-Monitors $HW.monitors
     }
     $ry = 8
     foreach ($key in $hwRows.Keys) {
@@ -460,7 +536,7 @@ function Show-InventoryForm {
 
         $ry += 18
     }
-    $yPos += 150
+    $yPos += 168
 
     # ── Buttons ───────────────────────────────────────────────────────────────
     $btnSubmit             = New-Object System.Windows.Forms.Button
@@ -621,7 +697,7 @@ if (-not (Test-ShouldRun)) { exit 0 }
 # Collect hardware
 Write-Log "Collecting hardware information…"
 $hw = Get-Hardware
-Write-Log "HW: $($hw | ConvertTo-Json -Compress)"
+Write-Log "HW: $($hw | ConvertTo-Json -Compress -Depth 4)"
 
 # Show GUI
 $res = Show-InventoryForm -HW $hw
@@ -646,6 +722,7 @@ $payload = @{
     type            = "checkin"
     submission_type = "online"
     timestamp     = $hw.timestamp
+    monitors      = $hw.monitors
     first_name    = $ud.first_name
     last_name     = $ud.last_name
     email         = $ud.email
