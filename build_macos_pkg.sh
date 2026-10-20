@@ -93,21 +93,48 @@ CONFIG_FILE="\$AGENT_DIR/config.json"
 PLIST_DIR="\$USER_HOME/Library/LaunchAgents"
 PLIST_FILE="\$PLIST_DIR/\$PLIST_LABEL.plist"
 
-# ── Locate Python 3 with working tkinter ─────────────────────────────────────
-PYTHON3=""
-for candidate in /opt/homebrew/bin/python3 /usr/local/bin/python3 /usr/bin/python3; do
-    if [[ -x "\$candidate" ]]; then
-        if sudo -u "\$CURRENT_USER" "\$candidate" -c \
-               "import tkinter; r=tkinter.Tk(); r.destroy()" &>/dev/null; then
-            PYTHON3="\$candidate"
-            break
-        fi
-    fi
-done
+# ── Python 3 with a working tkinter (silently installed from python.org if missing) ──
+PY_VERSION="3.13.15"
+PY_PKG_URL="https://www.python.org/ftp/python/\${PY_VERSION}/python-\${PY_VERSION}-macos11.pkg"
+PY_FWK="/Library/Frameworks/Python.framework/Versions/\${PY_VERSION%.*}"
+PSF_SIGNER="Developer ID Installer: Python Software Foundation (BMM5U3QVKW)"
 
-if [[ -z "\$PYTHON3" ]]; then
-    echo "postinstall: Python 3 with tkinter not found — agent will not function."
-    exit 1
+# Tk() must open in the user's GUI session; Apple's system Python aborts here on macOS 26+
+_tkinter_works() {
+    sudo -u "\$CURRENT_USER" "\$1" -c "import tkinter; r=tkinter.Tk(); r.destroy()" &>/dev/null
+}
+
+_find_python() {
+    local c candidates=("\$PY_FWK/bin/python3" /usr/local/bin/python3 /opt/homebrew/bin/python3)
+    xcode-select -p &>/dev/null && candidates+=(/usr/bin/python3)
+    for c in "\${candidates[@]}"; do
+        if [[ -x "\$c" ]] && _tkinter_works "\$c"; then echo "\$c"; return 0; fi
+    done
+    return 1
+}
+
+_install_python_org() {
+    local tmp sig
+    tmp=\$(mktemp -d)
+    curl -fsSL --retry 3 --connect-timeout 15 "\$PY_PKG_URL" -o "\$tmp/python.pkg" || { rm -rf "\$tmp"; return 1; }
+    sig=\$(pkgutil --check-signature "\$tmp/python.pkg" 2>/dev/null || true)
+    if [[ "\$sig" != *"\$PSF_SIGNER"* ]] || ! spctl --assess --type install "\$tmp/python.pkg" &>/dev/null; then
+        echo "postinstall: Python installer signature check failed — not installing."
+        rm -rf "\$tmp"; return 1
+    fi
+    printf '%s' '<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd"><plist version="1.0"><array><dict><key>attributeSetting</key><integer>0</integer><key>choiceAttribute</key><string>selected</string><key>choiceIdentifier</key><string>org.python.Python.PythonProfileChanges-'"\${PY_VERSION%.*}"'</string></dict></array></plist>' > "\$tmp/choices.xml"
+    installer -pkg "\$tmp/python.pkg" -target / -applyChoiceChangesXML "\$tmp/choices.xml" >/dev/null || { rm -rf "\$tmp"; return 1; }
+    # python.org builds ship without CA certificates — use the macOS system bundle
+    ln -sf /etc/ssl/cert.pem "\$PY_FWK/etc/openssl/cert.pem"
+    rm -rf "\$tmp"
+}
+
+if ! PYTHON3=\$(_find_python); then
+    echo "postinstall: no Python 3 with working tkinter — installing Python \${PY_VERSION} from python.org…"
+    if ! _install_python_org || ! PYTHON3=\$(_find_python); then
+        echo "postinstall: Python installation failed — agent will not function."
+        exit 1
+    fi
 fi
 echo "postinstall: Using Python: \$PYTHON3"
 

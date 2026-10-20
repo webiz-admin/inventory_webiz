@@ -66,7 +66,7 @@ done
 
 if [[ -z "$PYTHON3" ]]; then
     echo "      Python 3 not found — attempting to install…"
-    if   command -v apt-get &>/dev/null; then sudo apt-get install -y python3
+    if   command -v apt-get &>/dev/null; then sudo apt-get update -qq && sudo apt-get install -y python3
     elif command -v dnf     &>/dev/null; then sudo dnf install -y python3
     elif command -v pacman  &>/dev/null; then sudo pacman -S --noconfirm python
     else
@@ -85,6 +85,10 @@ if ! "$PYTHON3" -c "import tkinter" 2>/dev/null; then
     elif command -v pacman  &>/dev/null; then sudo pacman -S --noconfirm tk
     else
         echo "  [WARN] Could not auto-install tkinter. Install python3-tk manually."
+    fi
+    if ! "$PYTHON3" -c "import tkinter" 2>/dev/null; then
+        echo "  [ERROR] tkinter is still not available — install python3-tk and re-run."
+        exit 1
     fi
 fi
 echo "      Python + tkinter: OK"

@@ -51,73 +51,69 @@ echo "│   Webiz Inventory Agent – macOS Setup   │"
 echo "└─────────────────────────────────────────┘"
 echo ""
 
-# ── Step 1: Locate Python 3 ───────────────────────────────────────────────────
-echo "[1/5] Locating Python 3…"
-PYTHON3=""
-# Prefer Homebrew Python (ships with a modern, compatible Tcl/Tk) over the
-# Apple system Python 3.9 which bundles an older Tcl/Tk incompatible with macOS 26+.
-for candidate in \
-        /opt/homebrew/bin/python3 \
-        /usr/local/bin/python3 \
-        python3 \
-        python; do
-    if command -v "$candidate" &>/dev/null; then
-        ver=$("$candidate" --version 2>&1 || true)
-        if [[ "$ver" == Python\ 3* ]]; then
-            PYTHON3=$(command -v "$candidate")
-            echo "      Found: $PYTHON3  ($ver)"
-            break
-        fi
-    fi
-done
+# ── Step 1: Python 3 with a working tkinter (auto-installed if missing) ──────
+echo "[1/5] Checking Python 3…"
 
-if [[ -z "$PYTHON3" ]]; then
-    echo "      Python 3 not found — attempting to install via Homebrew…"
-    if command -v brew &>/dev/null; then
-        brew install python3 --quiet >/dev/null 2>&1
-        PYTHON3=$(command -v python3)
-    else
-        echo ""
-        echo "  ┌─ ACTION REQUIRED ─────────────────────────────────────────┐"
-        echo "  │ Homebrew not found. Please install Python 3 manually:     │"
-        echo "  │   https://www.python.org/downloads/                       │"
-        echo "  │ Then re-run this script.                                  │"
-        echo "  └───────────────────────────────────────────────────────────┘"
-        exit 1
-    fi
-fi
+# Official python.org build: universal2, bundles a Tcl/Tk that works on current macOS.
+PY_VERSION="3.13.15"
+PY_PKG_URL="https://www.python.org/ftp/python/${PY_VERSION}/python-${PY_VERSION}-macos11.pkg"
+PY_FWK="/Library/Frameworks/Python.framework/Versions/${PY_VERSION%.*}"
+PSF_SIGNER="Developer ID Installer: Python Software Foundation (BMM5U3QVKW)"
 
-# Check tkinter: verify it can actually open a window (not just import).
-# The Apple system Python 3.9 imports tkinter fine but crashes with an
-# "Abort trap: 6" when Tk() is instantiated on macOS 26+ due to a stale
-# Tcl/Tk internal version check.
-# Wrap in a nested subshell so the shell's "Abort trap: 6" job-control
-# message is printed into the subshell's stderr and can be redirected away.
+# Must actually open a window: Apple's system Python imports tkinter fine but
+# aborts ("Abort trap: 6") on Tk() under macOS 26+. The nested subshell keeps
+# the shell's job-control message out of the terminal.
 _tkinter_works() {
-    { ( "$PYTHON3" -c "import tkinter; r=tkinter.Tk(); r.destroy()" 2>/dev/null ); } 2>/dev/null
+    { ( "$1" -c "import tkinter; r=tkinter.Tk(); r.destroy()" 2>/dev/null ); } 2>/dev/null
 }
 
-if ! _tkinter_works; then
-    echo "      tkinter not functional (Tcl/Tk incompatible with this macOS version)."
-    echo "      Trying: brew install python-tk …"
-    if command -v brew &>/dev/null; then
-        brew list python-tk &>/dev/null || brew install python-tk --quiet >/dev/null 2>&1 || true
-        # brew install python-tk pulls in a Homebrew Python with a working Tcl/Tk
-        if [[ -x /opt/homebrew/bin/python3 ]]; then
-            PYTHON3=/opt/homebrew/bin/python3
-        elif [[ -x /usr/local/bin/python3 ]]; then
-            PYTHON3=/usr/local/bin/python3
-        fi
-    else
-        echo "      Homebrew not found — cannot auto-install python-tk."
+_find_python() {
+    local c candidates=("$PY_FWK/bin/python3" /usr/local/bin/python3 /opt/homebrew/bin/python3)
+    # /usr/bin/python3 is only a stub that pops up the Xcode tools dialog unless they are installed
+    xcode-select -p &>/dev/null && candidates+=(/usr/bin/python3)
+    for c in "${candidates[@]}"; do
+        if [[ -x "$c" ]] && _tkinter_works "$c"; then echo "$c"; return 0; fi
+    done
+    return 1
+}
+
+_install_python_org() {
+    local tmp sig
+    tmp=$(mktemp -d)
+    echo "      Downloading Python ${PY_VERSION} from python.org…"
+    if ! curl -fsSL --retry 3 --connect-timeout 15 "$PY_PKG_URL" -o "$tmp/python.pkg"; then
+        echo "      Download failed."; rm -rf "$tmp"; return 1
     fi
-    if ! _tkinter_works; then
+    # Only install a package signed by the PSF and notarized by Apple
+    sig=$(pkgutil --check-signature "$tmp/python.pkg" 2>/dev/null || true)
+    if [[ "$sig" != *"$PSF_SIGNER"* ]] || ! spctl --assess --type install "$tmp/python.pkg" &>/dev/null; then
+        echo "      [ERROR] Python installer signature check failed — not installing."
+        rm -rf "$tmp"; return 1
+    fi
+    # Don't let the installer edit the user's shell profile
+    printf '%s' '<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd"><plist version="1.0"><array><dict><key>attributeSetting</key><integer>0</integer><key>choiceAttribute</key><string>selected</string><key>choiceIdentifier</key><string>org.python.Python.PythonProfileChanges-'"${PY_VERSION%.*}"'</string></dict></array></plist>' > "$tmp/choices.xml"
+    echo "      Installing Python ${PY_VERSION} (administrator password required)…"
+    if ! sudo installer -pkg "$tmp/python.pkg" -target / -applyChoiceChangesXML "$tmp/choices.xml" >/dev/null; then
+        echo "      [ERROR] Python installation failed (is this account an administrator?)."
+        rm -rf "$tmp"; return 1
+    fi
+    # python.org builds ship without CA certificates — use the macOS system bundle
+    sudo ln -sf /etc/ssl/cert.pem "$PY_FWK/etc/openssl/cert.pem"
+    rm -rf "$tmp"
+}
+
+if PYTHON3=$(_find_python); then
+    echo "      Found: $PYTHON3  ($("$PYTHON3" --version 2>&1))"
+else
+    echo "      No Python 3 with a working tkinter found — installing automatically."
+    if ! _install_python_org || ! PYTHON3=$(_find_python); then
         echo ""
-        echo "  [ERROR] tkinter still not functional."
-        echo "  Fix: install Python 3 from https://www.python.org/downloads/ (includes Tcl/Tk)"
-        echo "  or run: brew install python-tk"
+        echo "  [ERROR] Could not install Python automatically."
+        echo "  Install it manually from https://www.python.org/downloads/macos/ and re-run,"
+        echo "  or contact IT."
         exit 1
     fi
+    echo "      Installed: $PYTHON3"
 fi
 echo "      Python + tkinter: OK"
 
