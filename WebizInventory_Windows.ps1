@@ -206,6 +206,7 @@ function Get-Hardware {
         $hw.timestamp  = (Get-Date -Format "yyyy-MM-ddTHH:mm:ss")
     }
     $hw.monitors = @(Get-Monitors)
+    $hw.screen_size_detected = $script:BuiltinScreenIn
     return $hw
 }
 
@@ -214,8 +215,28 @@ function Get-Hardware {
 #  USB-C / Thunderbolt monitors use DisplayPort Alt Mode, so they are reported as
 #  "DisplayPort/USB-C". Brand names are mapped from the PNP id by the Apps Script.
 # ════════════════════════════════════════════════════════════════════════════════
+# Physical image size (mm) from the EDID's preferred timing — WMI only gives whole cm.
+# EDID is read from the registry (readable without admin).
+function Get-EdidSizeMm([string]$InstanceName) {
+    try {
+        $key  = "HKLM:\SYSTEM\CurrentControlSet\Enum\" + ($InstanceName -replace '_\d+$', '') + "\Device Parameters"
+        $edid = [byte[]](Get-ItemProperty -LiteralPath $key -Name EDID -ErrorAction Stop).EDID
+        if ($edid.Length -ge 128) {
+            $w = $edid[66] -bor (($edid[68] -band 0xF0) -shl 4)
+            $h = $edid[67] -bor (($edid[68] -band 0x0F) -shl 8)
+            if ($w -gt 0 -and $h -gt 0) { return @($w, $h) }
+        }
+    } catch {}
+    return $null
+}
+
+# Marketed laptop sizes: the measured active area is slightly smaller (15.6" ≈ 15.55"),
+# so snap to the nearest marketed size within 0.2".
+$LaptopSizes = @(11.6, 12.0, 12.3, 12.5, 13.0, 13.3, 13.4, 13.5, 14.0, 14.5, 15.0, 15.6, 16.0, 17.3, 18.0)
+
 function Get-Monitors {
     $monitors = @()
+    $script:BuiltinScreenIn = ""   # set as a side result: the laptop's own panel size
     try {
         $ids = @(Get-CimInstance -Namespace root\wmi -ClassName WmiMonitorID -ErrorAction Stop)
         $conns = @{}; $sizes = @{}; $modes = @{}
@@ -229,8 +250,22 @@ function Get-Monitors {
 
         foreach ($m in $ids) {
             $tech = $conns[$m.InstanceName]
+            $mm   = Get-EdidSizeMm $m.InstanceName
+            $bp   = $sizes[$m.InstanceName]
+            if (-not $mm -and $bp -and $bp.MaxHorizontalImageSize -and $bp.MaxVerticalImageSize) {
+                $mm = @(($bp.MaxHorizontalImageSize * 10), ($bp.MaxVerticalImageSize * 10))
+            }
+            $diag = if ($mm) { [math]::Sqrt([math]::Pow($mm[0], 2) + [math]::Pow($mm[1], 2)) / 25.4 } else { 0 }
+
             # Built-in panel: LVDS (6), embedded DisplayPort (11), embedded UDI (13), INTERNAL (0x80000000)
-            if ($tech -in @(6, 11, 13) -or $tech -eq 2147483648) { continue }
+            if ($tech -in @(6, 11, 13) -or $tech -eq 2147483648) {
+                if ($diag -and -not $script:BuiltinScreenIn) {
+                    $nearest = $LaptopSizes | Sort-Object { [math]::Abs($_ - $diag) } | Select-Object -First 1
+                    $val = if ([math]::Abs($nearest - $diag) -le 0.2) { $nearest } else { [math]::Round($diag, 1) }
+                    $script:BuiltinScreenIn = $val.ToString([System.Globalization.CultureInfo]::InvariantCulture)
+                }
+                continue
+            }
             $connection = switch ($tech) {
                 0  { "VGA" }
                 4  { "DVI" }
@@ -241,12 +276,7 @@ function Get-Monitors {
                 16 { "Indirect (dock/USB)" }
                 default { "" }
             }
-            $sizeIn = ""
-            $bp = $sizes[$m.InstanceName]
-            if ($bp -and $bp.MaxHorizontalImageSize -and $bp.MaxVerticalImageSize) {
-                $sizeIn = [math]::Round([math]::Sqrt([math]::Pow($bp.MaxHorizontalImageSize, 2) +
-                                                     [math]::Pow($bp.MaxVerticalImageSize, 2)) / 2.54)
-            }
+            $sizeIn = if ($diag) { [math]::Round($diag) } else { "" }
             $resolution = ""
             $sm = $modes[$m.InstanceName]
             if ($sm -and $sm.MonitorSourceModes) {
@@ -479,6 +509,8 @@ function Show-InventoryForm {
     $tbScreen.Location  = New-Object System.Drawing.Point(152, $yPos)
     $tbScreen.Size      = New-Object System.Drawing.Size(342, 28)
     $tbScreen.Font      = New-Object System.Drawing.Font("Segoe UI", 10)
+    # Pre-filled from the built-in panel; still editable (empty on desktops)
+    if ($HW.screen_size_detected) { $tbScreen.Text = $HW.screen_size_detected }
     $form.Controls.Add($tbScreen)
     $yPos += 44
 

@@ -22,7 +22,7 @@
  */
 
 // Shown by doGet — lets IT confirm which version a deployment is actually serving
-const SCRIPT_VERSION = "3 (monitor columns)";
+const SCRIPT_VERSION = "4 (screen size column)";
 
 // ── Sheet names ───────────────────────────────────────────────────────────────
 const SHEET_NAME     = "Inventory";
@@ -43,7 +43,7 @@ const MAX_FIELD_LEN = 200;
 const HEADERS = [
   "Timestamp", "First Name", "Last Name", "Email", "Project",
   "Hostname", "IP Address", "Brand", "Model", "Serial Number",
-  "CPU", "RAM", "Storage", "OS"
+  "CPU", "RAM", "Storage", "OS", "Screen Size (in)"
 ];
 
 // ── Monitor columns on Inventory: up to INVENTORY_MONITOR_SLOTS monitors per device,
@@ -73,8 +73,8 @@ const COL = {
   RAM:           11,
   STORAGE:       12,
   OS:            13,
-  MONITORS:      14,   // first monitor column — monitor columns are not part of the
-                       // "did the device change" comparison (moves go to the Change Log)
+  SCREEN:        14,   // from here on: refreshed on every check-in but not part of the
+  MONITORS:      15,   // "did the device change" comparison (monitor moves go to the Change Log)
 };
 
 // ── Monitors sheet: one row per physical monitor ──────────────────────────────
@@ -287,6 +287,20 @@ function notifyCancelled(f) {
     `[Webiz Inventory] CANCELLED – SN: ${f.serial_number || "N/A"} / ${f.hostname}`, body);
 }
 
+/**
+ * Version 3 sheets have the monitor columns right after "OS". Insert the new
+ * "Screen Size (in)" column there so existing monitor data keeps its headers.
+ */
+function migrateInventoryLayout(ss) {
+  const sheet = ss.getSheetByName(SHEET_NAME);
+  if (!sheet || sheet.getLastColumn() <= COL.SCREEN) return;
+  const header = sheet.getRange(1, COL.SCREEN + 1).getValue();
+  if (String(header).trim() === "Monitor 1 Brand") {
+    sheet.insertColumnBefore(COL.SCREEN + 1);            // inherits the header formatting
+    sheet.getRange(1, COL.SCREEN + 1).setValue(HEADERS[COL.SCREEN]);
+  }
+}
+
 // ── Monitors ──────────────────────────────────────────────────────────────────
 
 /** Validates and normalises the agent's monitor list. */
@@ -426,6 +440,7 @@ function doPost(e) {
     lock.waitLock(20000);   // serialise sheet read-compare-write between concurrent devices
 
     const ss       = SpreadsheetApp.getActiveSpreadsheet();
+    migrateInventoryLayout(ss);
     const invSheet = getOrCreateSheet(ss, SHEET_NAME, HEADERS, "#1A2B5A");
 
     const sn       = f.serial_number;
@@ -448,6 +463,7 @@ function doPost(e) {
       f.ram,
       f.storage,
       f.os,
+      f.screen_size,
     ].concat(monitorCells(f.monitors));
 
     const existing = findExistingRow(invSheet, sn, hostname);
@@ -466,12 +482,12 @@ function doPost(e) {
       }
 
       if (allMatch) {
-        // Device/owner unchanged — keep the row, only refresh the monitor columns if they differ
-        const newMon = newRowValues.slice(COL.MONITORS);
-        const oldMon = existing.values.slice(COL.MONITORS);
-        if (newMon.some((v, i) => String(v).trim() !== String(oldMon[i]).trim())) {
-          invSheet.getRange(existing.rowNum, COL.MONITORS + 1, 1, newMon.length)
-                  .setValues([newMon.map(sheetSafe)]);
+        // Device/owner unchanged — keep the row, only refresh screen size + monitor columns
+        const newTail = newRowValues.slice(COL.SCREEN);
+        const oldTail = existing.values.slice(COL.SCREEN);
+        if (newTail.some((v, i) => String(v).trim() !== String(oldTail[i]).trim())) {
+          invSheet.getRange(existing.rowNum, COL.SCREEN + 1, 1, newTail.length)
+                  .setValues([newTail.map(sheetSafe)]);
         }
         appendChangeLog(ss, sheetSafe(sn), sheetSafe(hostname),
           `Collected nothing changed – ${now}`);

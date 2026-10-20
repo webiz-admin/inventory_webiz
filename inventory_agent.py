@@ -175,8 +175,12 @@ def _pnp(vendor: int) -> str:
     """16-bit EDID/EISA vendor number → 3-letter PNP id (e.g. 0x10AC → DEL)."""
     return "".join(chr(((vendor >> sh) & 31) + 64) for sh in (10, 5, 0)) if vendor else ""
 
-def _diag_in(w_mm: float, h_mm: float):
-    return round((w_mm ** 2 + h_mm ** 2) ** 0.5 / 25.4) if w_mm and h_mm else ""
+def _diag_in(w_mm: float, h_mm: float, decimals: int = 0):
+    """Diagonal in inches from the panel's physical size (mm)."""
+    if not (w_mm and h_mm):
+        return ""
+    d = round((w_mm ** 2 + h_mm ** 2) ** 0.5 / 25.4, decimals)
+    return int(d) if decimals == 0 else d
 
 def _connection(raw: str) -> str:
     r = (raw or "").lower()
@@ -192,8 +196,8 @@ def _connection(raw: str) -> str:
         return "AirPlay"
     return raw or ""
 
-def _mac_cg_displays() -> list:
-    """External displays via CoreGraphics (works on Intel + Apple Silicon)."""
+def _mac_cg_displays(builtin: bool = False) -> list:
+    """Displays via CoreGraphics (Intel + Apple Silicon): external ones, or the built-in panel."""
     import ctypes, ctypes.util
     cg = ctypes.CDLL(ctypes.util.find_library("CoreGraphics"))
 
@@ -214,7 +218,7 @@ def _mac_cg_displays() -> list:
         return []
     out = []
     for d in ids[:n.value]:
-        if cg.CGDisplayIsBuiltin(d):
+        if bool(cg.CGDisplayIsBuiltin(d)) != builtin:
             continue
         size = cg.CGDisplayScreenSize(d)
         out.append({
@@ -223,6 +227,7 @@ def _mac_cg_displays() -> list:
             "model": cg.CGDisplayModelNumber(d),
             "serial_num": cg.CGDisplaySerialNumber(d),
             "size_in": _diag_in(size.width, size.height),
+            "w_mm": size.width, "h_mm": size.height,
         })
     return out
 
@@ -282,7 +287,7 @@ def _parse_edid(edid: bytes) -> dict:
         "product_code":    f"{edid[10] | (edid[11] << 8):04X}",
         "serial":          "",
         "name":            "",
-        "size_in":         _diag_in(edid[21] * 10, edid[22] * 10),
+        "size_in":         _diag_in(edid[21] * 10, edid[22] * 10),   # cm; refined from the timing below
         "resolution":      "",
         "year":            1990 + edid[17] if edid[17] else "",
     }
@@ -300,16 +305,24 @@ def _parse_edid(edid: bytes) -> dict:
             v = blk[5] | ((blk[7] & 0xF0) << 4)
             if h and v:
                 info["resolution"] = f"{h}x{v}"
+            w_mm = blk[12] | ((blk[14] & 0xF0) << 4)    # image size in mm (more precise than cm)
+            h_mm = blk[13] | ((blk[14] & 0x0F) << 8)
+            if w_mm and h_mm:
+                info["size_in"] = _diag_in(w_mm, h_mm)
+                info["w_mm"], info["h_mm"] = w_mm, h_mm
     if not info["serial"] and serial_num:
         info["serial"] = str(serial_num)
     return info
 
-def _collect_monitors_linux() -> list:
-    monitors = []
+def _linux_connectors(builtin: bool):
     for conn in sorted(Path("/sys/class/drm").glob("card*-*")):
         port = conn.name.split("-", 1)[1]                 # e.g. HDMI-A-1, DP-2, eDP-1
-        if port.startswith(("eDP", "LVDS", "DSI")):       # built-in panel
-            continue
+        if port.startswith(("eDP", "LVDS", "DSI")) == builtin:
+            yield conn, port
+
+def _collect_monitors_linux() -> list:
+    monitors = []
+    for conn, port in _linux_connectors(builtin=False):
         try:
             if (conn / "status").read_text().strip() != "connected":
                 continue
@@ -329,8 +342,39 @@ def collect_monitors() -> list:
     except Exception as e:
         log.warning(f"Monitor detection failed: {e}")
         return []
-    return [{k: (_clean(str(v)) if v not in ("", None) else "") for k, v in m.items()}
+    return [{k: (_clean(str(v)) if v not in ("", None) else "") for k, v in m.items()
+             if k not in ("w_mm", "h_mm")}
             for m in mons[:MAX_MONITORS]]
+
+# Marketed laptop sizes. The diagonal of the panel's active area is slightly smaller
+# (a 15.6" panel measures ~15.55"), so the measured value is snapped to the nearest
+# marketed size within 0.2".
+APPLE_LAPTOP_SIZES   = (11.6, 12.0, 13.3, 13.6, 14.2, 15.3, 15.4, 16.0, 16.2)
+COMMON_LAPTOP_SIZES  = (11.6, 12.0, 12.3, 12.5, 13.0, 13.3, 13.4, 13.5, 14.0, 14.5,
+                        15.0, 15.6, 16.0, 17.3, 18.0)
+
+def _snap_size(d: float, sizes) -> float:
+    nearest = min(sizes, key=lambda x: abs(x - d))
+    return nearest if abs(nearest - d) <= 0.2 else d
+
+def builtin_screen_size() -> str:
+    """Laptop panel diagonal in inches (1 decimal), "" when there is no built-in screen."""
+    try:
+        if _sys == "Darwin":
+            panels = _mac_cg_displays(builtin=True)
+        else:
+            panels = []
+            for conn, _ in _linux_connectors(builtin=True):
+                if (conn / "status").read_text().strip() == "connected":
+                    panels.append(_parse_edid((conn / "edid").read_bytes()))
+        for p in panels:
+            size = _diag_in(p.get("w_mm"), p.get("h_mm"), decimals=2)
+            if size:
+                sizes = APPLE_LAPTOP_SIZES if _sys == "Darwin" else COMMON_LAPTOP_SIZES
+                return f"{_snap_size(size, sizes):g}"
+    except Exception as e:
+        log.warning(f"Built-in screen size detection failed: {e}")
+    return ""
 
 def monitors_summary(monitors: list) -> str:
     if not monitors:
@@ -400,6 +444,7 @@ def collect_hardware() -> dict:
         hw["os"]      = f"Linux {platform.release()}"
 
     hw["monitors"]  = collect_monitors()
+    hw["screen_size_detected"] = builtin_screen_size()
     hw["timestamp"] = datetime.datetime.now().isoformat(timespec="seconds")
     return hw
 
@@ -567,6 +612,9 @@ class InventoryForm(tk.Tk):
         ).grid(row=3, column=1, sticky="ew", padx=(8, 0), pady=(10, 2))
 
         self._e_screen  = self._field(form, 'Screen Size (in.) *', 4)
+        # Pre-filled from the built-in panel; still editable (empty on desktops)
+        if self.hw.get("screen_size_detected"):
+            self._e_screen.insert(0, self.hw["screen_size_detected"])
 
         # ── Device info preview ───────────────────────────────────────────────
         tk.Frame(self, bg="#D0D5DD", height=1).pack(fill="x", padx=26, pady=(12, 6))
