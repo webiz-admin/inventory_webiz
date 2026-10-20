@@ -1,0 +1,14 @@
+# Real endpoint URL + token — never commit
+webiz_config.json
+
+# Built installers contain the token — distribute internally, never commit
+dist/
+build_pkg/
+*.exe
+*.pkg
+
+# Local runtime files
+*.log
+state.json
+queue.json
+.DS_Store

@@ -1,0 +1,5 @@
+{
+  "apps_script_url": "https://script.google.com/macros/s/YOUR_DEPLOYMENT_ID/exec",
+  "agent_token": "generate with: python3 -c \"import secrets; print(secrets.token_hex(32))\"",
+  "github_raw_url": "https://raw.githubusercontent.com/webiz-admin/inventory_webiz/main/inventory_agent.py"
+}
