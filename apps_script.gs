@@ -40,8 +40,19 @@ const MAX_FIELD_LEN = 200;
 const HEADERS = [
   "Timestamp", "First Name", "Last Name", "Email", "Project",
   "Hostname", "IP Address", "Brand", "Model", "Serial Number",
-  "CPU", "RAM", "Storage", "OS", "External Monitors"
+  "CPU", "RAM", "Storage", "OS"
 ];
+
+// ── Monitor columns on Inventory: up to INVENTORY_MONITOR_SLOTS monitors per device,
+//    one column per field (every monitor, incl. extra ones, is also on the Monitors sheet)
+const INVENTORY_MONITOR_SLOTS = 2;
+const MONITOR_FIELDS = [
+  ["Brand", "brand"], ["Model", "model"], ["Size (in)", "size"], ["Serial", "serial"],
+  ["Resolution", "resolution"], ["Connection", "connection"], ["Year", "year"],
+];
+for (let i = 1; i <= INVENTORY_MONITOR_SLOTS; i++) {
+  MONITOR_FIELDS.forEach(([label]) => HEADERS.push(`Monitor ${i} ${label}`));
+}
 
 // 0-based column indices for Inventory
 const COL = {
@@ -59,7 +70,8 @@ const COL = {
   RAM:           11,
   STORAGE:       12,
   OS:            13,
-  MONITORS:      14,   // summary only — not part of the "did the device change" comparison
+  MONITORS:      14,   // first monitor column — monitor columns are not part of the
+                       // "did the device change" comparison (moves go to the Change Log)
 };
 
 // ── Monitors sheet: one row per physical monitor ──────────────────────────────
@@ -285,7 +297,7 @@ function cleanMonitors(raw) {
       if (/^0+$/.test(serial)) serial = "";   // many monitors report 0 instead of a serial
       return {
         brand:      PNP_BRANDS[pnp] || pnp,
-        model:      clean(m.name, 100) || clean(m.product_code, 20),
+        model:      stripBrand(clean(m.name, 100) || clean(m.product_code, 20), PNP_BRANDS[pnp] || pnp),
         serial:     serial,
         size:       clean(m.size_in, 5),
         resolution: clean(m.resolution, 20),
@@ -296,11 +308,25 @@ function cleanMonitors(raw) {
     .filter(m => m.brand || m.model);
 }
 
+/** "DELL U2724DE" with brand "Dell" → "U2724DE" (the brand has its own column). */
+function stripBrand(model, brand) {
+  if (brand && model.toLowerCase().indexOf(brand.toLowerCase() + " ") === 0) {
+    return model.slice(brand.length).trim();
+  }
+  return model;
+}
+
+/** Inventory cells for the first INVENTORY_MONITOR_SLOTS monitors (blank when absent). */
+function monitorCells(monitors) {
+  const cells = [];
+  for (let i = 0; i < INVENTORY_MONITOR_SLOTS; i++) {
+    MONITOR_FIELDS.forEach(([, key]) => cells.push(monitors[i] ? monitors[i][key] : ""));
+  }
+  return cells;
+}
+
 function monitorLabel(m) {
-  // "Dell" + "DELL U2724DE" → "Dell U2724DE"
-  const sameBrand = m.brand && m.model.toLowerCase().indexOf(m.brand.toLowerCase()) === 0;
-  return [m.brand, sameBrand ? m.model.slice(m.brand.length).trim() : m.model]
-           .filter(Boolean).join(" ") +
+  return [m.brand, m.model].filter(Boolean).join(" ") +
          (m.size ? ` ${m.size}"` : "") + (m.connection ? ` (${m.connection})` : "");
 }
 
@@ -419,8 +445,7 @@ function doPost(e) {
       f.ram,
       f.storage,
       f.os,
-      monitorsSummary(f.monitors),
-    ];
+    ].concat(monitorCells(f.monitors));
 
     const existing = findExistingRow(invSheet, sn, hostname);
 
@@ -438,10 +463,12 @@ function doPost(e) {
       }
 
       if (allMatch) {
-        // Nothing changed — keep the row, only refresh the monitor summary if it differs
-        if (String(existing.values[COL.MONITORS]).trim() !== newRowValues[COL.MONITORS]) {
-          invSheet.getRange(existing.rowNum, COL.MONITORS + 1)
-                  .setValue(sheetSafe(newRowValues[COL.MONITORS]));
+        // Device/owner unchanged — keep the row, only refresh the monitor columns if they differ
+        const newMon = newRowValues.slice(COL.MONITORS);
+        const oldMon = existing.values.slice(COL.MONITORS);
+        if (newMon.some((v, i) => String(v).trim() !== String(oldMon[i]).trim())) {
+          invSheet.getRange(existing.rowNum, COL.MONITORS + 1, 1, newMon.length)
+                  .setValues([newMon.map(sheetSafe)]);
         }
         appendChangeLog(ss, sheetSafe(sn), sheetSafe(hostname),
           `Collected nothing changed – ${now}`);
