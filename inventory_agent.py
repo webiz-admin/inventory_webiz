@@ -444,7 +444,7 @@ def collect_hardware() -> dict:
         hw["os"]      = f"Linux {platform.release()}"
 
     hw["monitors"]  = collect_monitors()
-    hw["screen_size_detected"] = builtin_screen_size()
+    hw["screen_size"] = builtin_screen_size()   # detected, not asked from the user
     hw["timestamp"] = datetime.datetime.now().isoformat(timespec="seconds")
     return hw
 
@@ -554,7 +554,7 @@ class InventoryForm(tk.Tk):
         self.focus_force()
 
     def _center(self):
-        w, h = 520, 644
+        w, h = 520, 600
         self.update_idletasks()
         x = (self.winfo_screenwidth()  - w) // 2
         y = (self.winfo_screenheight() - h) // 2
@@ -611,10 +611,6 @@ class InventoryForm(tk.Tk):
             state="readonly", font=("Helvetica", 11), width=36,
         ).grid(row=3, column=1, sticky="ew", padx=(8, 0), pady=(10, 2))
 
-        self._e_screen  = self._field(form, 'Screen Size (in.) *', 4)
-        # Pre-filled from the built-in panel; still editable (empty on desktops)
-        if self.hw.get("screen_size_detected"):
-            self._e_screen.insert(0, self.hw["screen_size_detected"])
 
         # ── Device info preview ───────────────────────────────────────────────
         tk.Frame(self, bg="#D0D5DD", height=1).pack(fill="x", padx=26, pady=(12, 6))
@@ -623,8 +619,9 @@ class InventoryForm(tk.Tk):
         tk.Label(pf, text="Device information that will be recorded:",
                  font=("Helvetica", 9, "italic"), fg="#6B7280", bg=BG_COLOR).pack(anchor="w")
         hw = self.hw
+        screen = f' {hw["screen_size"]}"' if hw.get("screen_size") else ""
         preview = (
-            f"  {hw['brand']} {hw['model']}  •  SN: {hw.get('serial_number','?')}  •  {hw['os']}\n"
+            f"  {hw['brand']} {hw['model']}{screen}  •  SN: {hw.get('serial_number','?')}  •  {hw['os']}\n"
             f"  CPU: {hw['cpu']}  •  RAM: {hw['ram']}  •  Storage: {hw['storage']}\n"
             f"  Host: {hw['hostname']}  •  IP: {hw['ip_address']}\n"
             f"  Monitors: {monitors_summary(hw.get('monitors', []))}"
@@ -664,9 +661,6 @@ class InventoryForm(tk.Tk):
         if not re.match(r"[^@]+@[^@]+\.[^@]+", self._e_email.get().strip()):
             messagebox.showwarning("Invalid email", "Please enter a valid email address.", parent=self)
             return False
-        if not self._e_screen.get().strip():
-            messagebox.showwarning("Missing field", "Please enter the screen size (inches).", parent=self)
-            return False
         return True
 
     def _on_submit(self):
@@ -677,7 +671,6 @@ class InventoryForm(tk.Tk):
             "last_name":   self._e_last.get().strip(),
             "email":       self._e_email.get().strip(),
             "project":     self._v_project.get(),
-            "screen_size": self._e_screen.get().strip(),
         }
         self.submitted = True
         self.destroy()

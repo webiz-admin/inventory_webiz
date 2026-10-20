@@ -206,7 +206,7 @@ function Get-Hardware {
         $hw.timestamp  = (Get-Date -Format "yyyy-MM-ddTHH:mm:ss")
     }
     $hw.monitors = @(Get-Monitors)
-    $hw.screen_size_detected = $script:BuiltinScreenIn
+    $hw.screen_size = $script:BuiltinScreenIn   # detected, not asked from the user
     return $hw
 }
 
@@ -400,7 +400,7 @@ function Show-InventoryForm {
     # ── Form ──────────────────────────────────────────────────────────────────
     $form                  = New-Object System.Windows.Forms.Form
     $form.Text             = "Webiz Inventory Agent"
-    $form.ClientSize       = New-Object System.Drawing.Size(520, 702)
+    $form.ClientSize       = New-Object System.Drawing.Size(520, 676)
     $form.StartPosition    = "CenterScreen"
     $form.FormBorderStyle  = "FixedDialog"
     $form.MaximizeBox      = $false
@@ -497,23 +497,6 @@ function Show-InventoryForm {
     $form.Controls.Add($cbProject)
     $yPos += 44
 
-    # Screen size field
-    $lblScreen          = New-Object System.Windows.Forms.Label
-    $lblScreen.Text     = "Screen Size (in.) *"
-    $lblScreen.Location = New-Object System.Drawing.Point(26, ($yPos + 4))
-    $lblScreen.Size     = New-Object System.Drawing.Size(120, 22)
-    $lblScreen.Font     = New-Object System.Drawing.Font("Segoe UI", 10, [System.Drawing.FontStyle]::Bold)
-    $form.Controls.Add($lblScreen)
-
-    $tbScreen           = New-Object System.Windows.Forms.TextBox
-    $tbScreen.Location  = New-Object System.Drawing.Point(152, $yPos)
-    $tbScreen.Size      = New-Object System.Drawing.Size(342, 28)
-    $tbScreen.Font      = New-Object System.Drawing.Font("Segoe UI", 10)
-    # Pre-filled from the built-in panel; still editable (empty on desktops)
-    if ($HW.screen_size_detected) { $tbScreen.Text = $HW.screen_size_detected }
-    $form.Controls.Add($tbScreen)
-    $yPos += 44
-
     # ── Separator ─────────────────────────────────────────────────────────────
     $sep           = New-Object System.Windows.Forms.Panel
     $sep.Location  = New-Object System.Drawing.Point(26, ($yPos + 10))
@@ -534,12 +517,13 @@ function Show-InventoryForm {
 
     $hwPanel           = New-Object System.Windows.Forms.Panel
     $hwPanel.Location  = New-Object System.Drawing.Point(26, $yPos)
-    $hwPanel.Size      = New-Object System.Drawing.Size(468, 160)
+    $hwPanel.Size      = New-Object System.Drawing.Size(468, 178)
     $hwPanel.BackColor = [System.Drawing.Color]::FromArgb(229, 234, 242)
     $form.Controls.Add($hwPanel)
 
     $hwRows = [ordered]@{
         "Device"   = "$($HW.brand) $($HW.model)"
+        "Screen"   = if ($HW.screen_size) { "$($HW.screen_size)`" (built-in)" } else { "no built-in display" }
         "Serial"   = $HW.serial_number
         "OS"       = $HW.os
         "CPU"      = $HW.cpu
@@ -568,7 +552,7 @@ function Show-InventoryForm {
 
         $ry += 18
     }
-    $yPos += 168
+    $yPos += 186
 
     # ── Buttons ───────────────────────────────────────────────────────────────
     $btnSubmit             = New-Object System.Windows.Forms.Button
@@ -603,16 +587,12 @@ function Show-InventoryForm {
         if ($tbEmail.Text -notmatch '^[^@]+@[^@]+\.[^@]+$') {
             [System.Windows.Forms.MessageBox]::Show("Please enter a valid email address.", "Invalid email") | Out-Null; return
         }
-        if (-not $tbScreen.Text.Trim()) {
-            [System.Windows.Forms.MessageBox]::Show("Please enter the screen size (inches).", "Missing field") | Out-Null; return
-        }
         $result.submitted = $true
         $result.user_data  = @{
             first_name  = $tbFirst.Text.Trim()
             last_name   = $tbLast.Text.Trim()
             email       = $tbEmail.Text.Trim()
             project     = $cbProject.SelectedItem.ToString()
-            screen_size = $tbScreen.Text.Trim()
         }
         $form.Close()
     })
@@ -759,7 +739,7 @@ $payload = @{
     last_name     = $ud.last_name
     email         = $ud.email
     project       = $ud.project
-    screen_size   = $ud.screen_size
+    screen_size   = $hw.screen_size
     hostname      = $hw.hostname
     ip_address    = $hw.ip_address
     brand         = $hw.brand
