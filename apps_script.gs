@@ -21,6 +21,9 @@
  * secrets live only in Script Properties.
  */
 
+// Shown by doGet — lets IT confirm which version a deployment is actually serving
+const SCRIPT_VERSION = "3 (monitor columns)";
+
 // ── Sheet names ───────────────────────────────────────────────────────────────
 const SHEET_NAME     = "Inventory";
 const CHANGELOG_NAME = "Change Log";
@@ -506,5 +509,5 @@ function doPost(e) {
 
 // Simple health-check (open URL in browser to verify deployment is alive)
 function doGet(e) {
-  return ContentService.createTextOutput("Webiz Inventory API – OK");
+  return ContentService.createTextOutput("Webiz Inventory API – OK · v" + SCRIPT_VERSION);
 }
