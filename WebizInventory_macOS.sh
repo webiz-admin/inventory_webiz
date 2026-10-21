@@ -60,17 +60,15 @@ PY_PKG_URL="https://www.python.org/ftp/python/${PY_VERSION}/python-${PY_VERSION}
 PY_FWK="/Library/Frameworks/Python.framework/Versions/${PY_VERSION%.*}"
 PSF_SIGNER="Developer ID Installer: Python Software Foundation (BMM5U3QVKW)"
 
-# Must actually open a window: Apple's system Python imports tkinter fine but
-# aborts ("Abort trap: 6") on Tk() under macOS 26+. The nested subshell keeps
-# the shell's job-control message out of the terminal.
+# Must actually open a window, with Tk >= 8.6: Apple's Python ships Tk 8.5, which on
+# macOS 26+ either aborts ("Abort trap: 6") on Tk() or opens a blank, hung window.
+# The nested subshell keeps the shell's job-control message out of the terminal.
 _tkinter_works() {
-    { ( "$1" -c "import tkinter; r=tkinter.Tk(); r.destroy()" 2>/dev/null ); } 2>/dev/null
+    { ( "$1" -c "import tkinter, sys; sys.exit(tkinter.TkVersion < 8.6); r=tkinter.Tk(); r.destroy()" 2>/dev/null ); } 2>/dev/null
 }
 
 _find_python() {
     local c candidates=("$PY_FWK/bin/python3" /usr/local/bin/python3 /opt/homebrew/bin/python3)
-    # /usr/bin/python3 is only a stub that pops up the Xcode tools dialog unless they are installed
-    xcode-select -p &>/dev/null && candidates+=(/usr/bin/python3)
     for c in "${candidates[@]}"; do
         if [[ -x "$c" ]] && _tkinter_works "$c"; then echo "$c"; return 0; fi
     done

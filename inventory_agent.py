@@ -723,7 +723,11 @@ def main():
     hw = collect_hardware()
     log.info(json.dumps(hw, indent=2))
 
-    # 5. Show GUI
+    # 5. Show GUI — Apple's Python ships Tk 8.5, which on macOS 26+ opens a blank, hung window
+    if _sys == "Darwin" and tk.TkVersion < 8.6:
+        log.error(f"Tk {tk.TkVersion} at {sys.executable} cannot draw the form on this macOS "
+                  "— reinstall the agent so it sets up Python from python.org.")
+        sys.exit(1)
     app = InventoryForm(hw)
     app.mainloop()
 

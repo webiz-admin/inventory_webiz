@@ -99,14 +99,14 @@ PY_PKG_URL="https://www.python.org/ftp/python/\${PY_VERSION}/python-\${PY_VERSIO
 PY_FWK="/Library/Frameworks/Python.framework/Versions/\${PY_VERSION%.*}"
 PSF_SIGNER="Developer ID Installer: Python Software Foundation (BMM5U3QVKW)"
 
-# Tk() must open in the user's GUI session; Apple's system Python aborts here on macOS 26+
+# Tk() must open in the user's GUI session, with Tk >= 8.6: Apple's Python ships Tk 8.5,
+# which on macOS 26+ either aborts on Tk() or opens a blank, hung window
 _tkinter_works() {
-    sudo -u "\$CURRENT_USER" "\$1" -c "import tkinter; r=tkinter.Tk(); r.destroy()" &>/dev/null
+    sudo -u "\$CURRENT_USER" "\$1" -c "import tkinter, sys; sys.exit(tkinter.TkVersion < 8.6); r=tkinter.Tk(); r.destroy()" &>/dev/null
 }
 
 _find_python() {
     local c candidates=("\$PY_FWK/bin/python3" /usr/local/bin/python3 /opt/homebrew/bin/python3)
-    xcode-select -p &>/dev/null && candidates+=(/usr/bin/python3)
     for c in "\${candidates[@]}"; do
         if [[ -x "\$c" ]] && _tkinter_works "\$c"; then echo "\$c"; return 0; fi
     done
